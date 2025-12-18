@@ -9,7 +9,7 @@ import uuid
 # ---------------- CONFIG ----------------
 WIDTH = 10
 HEIGHT = 20
-TICK = 0.25
+TICK = 0.40
 SHARED_DIR = "/sgoinfre/lusteur/tetris"
 READ_INTERVAL = 0.05
 BLOCK_SIZE = 2  # Each block is [] which is 2 characters
