@@ -1,1 +1,1 @@
-run program with python3 tetris11.py "your username"
+run program with python3 "version.py" "your username"
