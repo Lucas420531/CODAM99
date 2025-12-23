@@ -46,3 +46,4 @@ Value  Binary   Char
  29    11101     5
  30    11110     6
  31    11111     7
+also gonna add a 1v1 mode with elo
