@@ -5,6 +5,7 @@ import os
 import random
 from collections import deque
 import uuid
+import base64
 
 # ================== CONFIG ==================
 
@@ -13,14 +14,14 @@ WIDTH = 10
 HEIGHT = 20
 
 # --- Timing Settings ---
-TICK = 0.20  # Base gravity tick (seconds)
-READ_INTERVAL = 0.05  # How often to check for garbage files
+TICK = 0.40  # Base gravity tick (seconds)
+READ_INTERVAL = 0.05  # How often to check for garbage files / remote states
 LEADERBOARD_REFRESH = 2.0  # Refresh leaderboard every N seconds
 GARBAGE_DELAY = 0.5  # Seconds before garbage files are deleted
 LOCK_DELAY = 0.5  # Time before piece locks when on ground
 LOCK_DELAY_RESETS = 15  # Max lock delay resets per piece
-MESSAGE_DISPLAY_TIME = 3.0  # How long garbage messages show
-COUNTDOWN_SECONDS = 2  # Countdown before game starts
+MESSAGE_DISPLAY_TIME = 3.0  # How long garbage / KO messages show
+COUNTDOWN_SECONDS = 3  # Countdown before game starts
 COUNTDOWN_GO_DELAY = 0.5  # Pause after "GO!" displays
 SPIN_MESSAGE_DURATION = 1.5  # How long spin messages display
 LOOP_SLEEP = 0.01  # Main loop sleep interval
@@ -40,9 +41,13 @@ DEATH_FILE_CLEANUP = 30.0  # Seconds before death files are cleaned up
 SHARED_DIR = "/sgoinfre/lusteur/tetris"
 GARBAGE_BUFFER_PIECES = 3  # Pieces before garbage applies
 
+# --- Multiplayer State Sharing ---
+STATE_PUBLISH_INTERVAL = 0.10  # How often to publish local game state (seconds)
+STATE_STALE_TIME = 2.0         # Ignore remote states older than this (seconds)
+
 # --- Visual Settings ---
 BLOCK_SIZE = 2  # Characters per block width (should match BLOCK_CHAR length)
-BLOCK_CHAR = "##"  # Character(s) for drawing blocks
+BLOCK_CHAR = "██"  # Character(s) for drawing blocks
 EMPTY_CHAR = "  "  # Character(s) for empty cells
 WALL_CHAR = "#"  # Character for walls
 BORDER_H_CHAR = "-"  # Horizontal border for preview boxes
@@ -65,6 +70,8 @@ KEYBIND_PROFILES = {
         "hold": ord('c'),
         "quit": ord('q'),
         "pause": None,
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
     },
     "spectator": {
         "next_player": ord('d'),
@@ -88,6 +95,8 @@ KEYBIND_PROFILES = {
         "target_prev": ord('r'),
         "target_random": ord('t'),
         "target_attacker": ord('y'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
     },
     "splitscreen_p1": {
         "left": ord('a'),
@@ -115,12 +124,14 @@ KEYBIND_PROFILES = {
         "left": curses.KEY_LEFT,
         "right": curses.KEY_RIGHT,
         "rotate_cw": curses.KEY_UP,
-        "rotate_ccw": ord('w'),
+        "rotate_ccw": ord('z'),
         "soft_drop": curses.KEY_DOWN,
         "hard_drop": ord(' '),
         "hold": ord('c'),
         "quit": ord('q'),
         "pause": ord('p'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
     },
     "vim": {
         "left": ord('h'),
@@ -132,10 +143,12 @@ KEYBIND_PROFILES = {
         "hold": ord('f'),
         "quit": ord('q'),
         "pause": ord('p'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
     },
 }
 
-ACTIVE_PROFILE = "arrow_keys"
+ACTIVE_PROFILE = "default"
 SPLITSCREEN_P1_PROFILE = "splitscreen_p1"
 SPLITSCREEN_P2_PROFILE = "splitscreen_p2"
 SPECTATOR_PROFILE = "spectator"
@@ -199,6 +212,8 @@ def key_name(keycode):
         27: "ESC",
         ord('`'): "`",
         ord('\\'): "\\",
+        ord('['): "[",
+        ord(']'): "]",
     }
     if keycode in special_keys:
         return special_keys[keycode]
@@ -353,6 +368,11 @@ COLORS = {
     "I": 1, "O": 2, "T": 3, "S": 4, "Z": 5, "J": 6, "L": 7, "garbage": 8
 }
 
+# Piece encoding order for state sharing
+PIECE_ORDER = ["I", "O", "T", "S", "Z", "J", "L"]
+PIECE_TO_INDEX = {name: i for i, name in enumerate(PIECE_ORDER)}
+INDEX_TO_PIECE = {i: name for name, i in PIECE_TO_INDEX.items()}
+
 COLORS_INITIALIZED = False
 
 def rotate_matrix(shape):
@@ -402,23 +422,16 @@ def check_tspin(board, x, y):
     Must be called BEFORE locking the piece.
     Checks the 4 corners around the T's center.
     """
-    # T piece center is at (x+1, y+1) in all rotations
     center_x, center_y = x + 1, y + 1
     corners_filled = 0
-    
-    # Check all 4 corners around the center
     for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
         check_x, check_y = center_x + dx, center_y + dy
-        # Out of bounds counts as filled
         if check_x < 0 or check_x >= WIDTH or check_y >= HEIGHT:
             corners_filled += 1
-        # Above the board doesn't count
         elif check_y < 0:
             continue
-        # Check if cell is occupied
         elif board[check_y][check_x]:
             corners_filled += 1
-    
     return corners_filled >= 3
 
 def try_rotation(board, shape, x, y, piece_name, current_rotation, clockwise=True):
@@ -457,7 +470,6 @@ def calculate_garbage(lines_cleared, is_tspin, last_was_line):
         return 0
     
     if is_tspin:
-        # T-spin bonuses
         if lines_cleared == 1:
             return 2  # T-spin single
         elif lines_cleared == 2:
@@ -465,9 +477,8 @@ def calculate_garbage(lines_cleared, is_tspin, last_was_line):
         elif lines_cleared == 3:
             return 6  # T-spin triple
     else:
-        # Normal line clears
         if lines_cleared == 1:
-            return 1 if last_was_line else 0  # Back-to-back bonus
+            return 1 if last_was_line else 0
         elif lines_cleared == 2:
             return 1
         elif lines_cleared == 3:
@@ -639,9 +650,7 @@ def check_deaths(current_ko_count):
                     dead_player = parts[1]
                     file_timestamp = float(parts[2])
                     
-                    # IMPORTANT: Skip our own death files
                     if dead_player == PLAYER:
-                        # Clean up old self death files
                         if current_time - file_timestamp > DEATH_FILE_CLEANUP:
                             try:
                                 os.remove(f"{SHARED_DIR}/{fname}")
@@ -649,19 +658,15 @@ def check_deaths(current_ko_count):
                                 pass
                         continue
                     
-                    # Check if we've already counted this death
                     if fname not in known_deaths:
                         known_deaths.add(fname)
                         new_kos += 1
-                        
-                        # Show KO message
                         new_total = current_ko_count + new_kos
                         msg_template = random.choice(KO_MESSAGES)
                         msg = msg_template.format(player=dead_player, kos=new_total)
                         expire_time = time.time() + MESSAGE_DISPLAY_TIME
                         ko_messages.append((msg, expire_time))
                     
-                    # Clean up old death files
                     if current_time - file_timestamp > DEATH_FILE_CLEANUP:
                         try:
                             os.remove(f"{SHARED_DIR}/{fname}")
@@ -696,16 +701,13 @@ def save_highscore(lines_sent, ko_count):
                 except:
                     pass
         
-        # Only save if new score is higher
         if lines_sent > existing_best:
-            # Remove old highscore files for this player
             for old_file in existing_files:
                 try:
                     os.remove(f"{SHARED_DIR}/{old_file}")
                 except:
                     pass
             
-            # Create new highscore file
             unique_id = str(uuid.uuid4())[:8]
             score_file = f"{SHARED_DIR}/highscore_{PLAYER}_{lines_sent}_{ko_count}_{unique_id}.txt"
             open(score_file, "w").close()
@@ -718,7 +720,7 @@ def get_leaderboard():
     File format: highscore_{PLAYER}_{lines_sent}_{kos}_{uuid}.txt
     Only shows highest per player.
     """
-    scores = {}  # player -> {lines, kos}
+    scores = {}
     try:
         files = os.listdir(SHARED_DIR)
         for fname in files:
@@ -754,6 +756,192 @@ def get_color_attr(color_pair_num):
     if USE_COLORS:
         return curses.color_pair(color_pair_num)
     return 0
+
+# ============== RENDERABLE GAME STATE ENCODE/DECODE ==============
+
+def encode_game_state(board, piece_name, rotation, x, y):
+    """
+    Encode full renderable game state (board + active piece) to Base64url.
+
+    Bits layout:
+      - 200 bits: board occupancy (row-major, 10x20, 1=filled, 0=empty)
+      - 3 bits : piece index (I,O,T,S,Z,J,L)
+      - 2 bits : rotation (0..3)
+      - 4 bits : x (0..15, clamped)
+      - 6 bits : y + 32 (0..63, clamped)
+    """
+    bits = []
+    # Board occupancy
+    for r in range(HEIGHT):
+        for c in range(WIDTH):
+            bits.append(1 if board[r][c] else 0)
+    
+    # Piece index (3 bits)
+    piece_idx = PIECE_TO_INDEX.get(piece_name, 0)
+    for shift in (2, 1, 0):
+        bits.append((piece_idx >> shift) & 1)
+    
+    # Rotation (2 bits)
+    rot = rotation & 0b11
+    bits.append((rot >> 1) & 1)
+    bits.append(rot & 1)
+    
+    # X (4 bits, clamped)
+    x_clamped = max(0, min(x, (1 << 4) - 1))
+    for shift in (3, 2, 1, 0):
+        bits.append((x_clamped >> shift) & 1)
+    
+    # Y (6 bits, with offset +32)
+    y_off = y + 32
+    y_off = max(0, min(y_off, (1 << 6) - 1))
+    for shift in (5, 4, 3, 2, 1, 0):
+        bits.append((y_off >> shift) & 1)
+    
+    # Pack bits into bytes
+    byte_array = bytearray()
+    for i in range(0, len(bits), 8):
+        byte_val = 0
+        for j in range(8):
+            if i + j < len(bits):
+                byte_val |= (bits[i + j] << (7 - j))
+        byte_array.append(byte_val)
+    
+    encoded = base64.urlsafe_b64encode(bytes(byte_array)).decode("ascii").rstrip("=")
+    return encoded
+
+def decode_game_state(encoded):
+    """
+    Decode Base64url encoded game state back to (board, piece_name, rotation, x, y).
+
+    Returns None on error.
+    """
+    # Add padding for base64 decoding
+    padding = (4 - len(encoded) % 4) % 4
+    padded = encoded + "=" * padding
+    try:
+        data = base64.urlsafe_b64decode(padded)
+    except Exception:
+        return None
+    
+    bits = []
+    for b in data:
+        for j in range(8):
+            bits.append((b >> (7 - j)) & 1)
+    
+    total_cells = WIDTH * HEIGHT
+    needed_bits = total_cells + 3 + 2 + 4 + 6  # 215 bits
+    if len(bits) < needed_bits:
+        return None
+    
+    # Board occupancy
+    board = []
+    for r in range(HEIGHT):
+        row = []
+        for c in range(WIDTH):
+            idx = r * WIDTH + c
+            filled = bits[idx]
+            # Render filled cells with "garbage" color for stack visualization
+            row.append(8 if filled else 0)
+        board.append(row)
+    
+    idx = total_cells
+    # Piece index (3 bits)
+    piece_idx = (bits[idx] << 2) | (bits[idx+1] << 1) | bits[idx+2]
+    idx += 3
+    piece_name = INDEX_TO_PIECE.get(piece_idx, "I")
+    
+    # Rotation (2 bits)
+    rotation = (bits[idx] << 1) | bits[idx+1]
+    idx += 2
+    rotation &= 0b11
+    
+    # X (4 bits)
+    x = (bits[idx] << 3) | (bits[idx+1] << 2) | (bits[idx+2] << 1) | bits[idx+3]
+    idx += 4
+    
+    # Y (6 bits, minus offset)
+    y_off = 0
+    for shift in (5, 4, 3, 2, 1, 0):
+        y_off = (y_off << 1) | bits[idx]
+        idx += 1
+    y = y_off - 32
+    
+    return board, piece_name, rotation, x, y
+
+def publish_game_state(board, piece_name, rotation, x, y):
+    """
+    Publish encoded game state to shared filesystem.
+
+    File format: state_{PLAYER}_{timestamp}_{encoded}_{uuid}.txt
+    """
+    try:
+        encoded = encode_game_state(board, piece_name, rotation, x, y)
+        timestamp = time.time()
+        unique_id = str(uuid.uuid4())[:8]
+        
+        # Remove older state files for this player
+        try:
+            files = os.listdir(SHARED_DIR)
+            for fname in files:
+                if fname.startswith(f"state_{PLAYER}_") and fname.endswith(".txt"):
+                    try:
+                        os.remove(f"{SHARED_DIR}/{fname}")
+                    except:
+                        pass
+        except:
+            pass
+        
+        filename = f"state_{PLAYER}_{timestamp}_{encoded}_{unique_id}.txt"
+        filepath = f"{SHARED_DIR}/{filename}"
+        open(filepath, "w").close()
+    except:
+        pass
+
+def get_remote_states():
+    """
+    Read remote players' game states from shared directory.
+
+    Returns:
+        dict: { player_name: { "board": ..., "piece": ..., "rotation": ..., "x": ..., "y": ..., "timestamp": ... } }
+    """
+    states = {}
+    current_time = time.time()
+    try:
+        files = os.listdir(SHARED_DIR)
+        for fname in files:
+            if fname.startswith("state_") and fname.endswith(".txt"):
+                try:
+                    # state_{player}_{timestamp}_{encoded}_{uuid}.txt
+                    parts = fname[:-4].split("_")
+                    if len(parts) < 5:
+                        continue
+                    player_name = parts[1]
+                    if player_name == PLAYER:
+                        continue
+                    timestamp = float(parts[2])
+                    if current_time - timestamp > STATE_STALE_TIME:
+                        continue
+                    encoded = "_".join(parts[3:-1])
+                    decoded = decode_game_state(encoded)
+                    if not decoded:
+                        continue
+                    board, piece_name, rotation, x, y = decoded
+                    if (player_name not in states) or (timestamp > states[player_name]["timestamp"]):
+                        states[player_name] = {
+                            "board": board,
+                            "piece": piece_name,
+                            "rotation": rotation,
+                            "x": x,
+                            "y": y,
+                            "timestamp": timestamp,
+                        }
+                except:
+                    pass
+    except:
+        pass
+    return states
+
+# ============== DRAWING HELPERS ==============
 
 def draw_preview(stdscr, shape, piece_name, row_offset, col_offset, title):
     try:
@@ -814,10 +1002,87 @@ def draw_garbage_indicator(stdscr, garbage_info, offset_x, offset_y):
                     pass
                 current_row -= 1
 
+def draw_board_area(stdscr, board, shape, x, y, color, offset_x, offset_y):
+    """
+    Single rendering path for a full board (local or remote).
+    Draws borders, walls, locked cells, active piece, and ghost.
+    """
+    field_width = WIDTH * BLOCK_SIZE + 2
+    ghost_y = get_ghost_y(board, shape, x, y) if GHOST_ENABLED else y
+    try:
+        # Top border
+        top_border = WALL_CHAR * field_width
+        stdscr.addstr(offset_y, offset_x, top_border)
+        
+        # Board rows
+        for r in range(HEIGHT):
+            stdscr.addstr(offset_y + r + 1, offset_x, WALL_CHAR)
+            for c in range(WIDTH):
+                cell_drawn = False
+                # Active piece
+                for pr in range(len(shape)):
+                    for pc in range(len(shape[0])):
+                        if shape[pr][pc]:
+                            if r == y + pr and c == x + pc:
+                                stdscr.addstr(
+                                    offset_y + r + 1,
+                                    offset_x + c * BLOCK_SIZE + 1,
+                                    BLOCK_CHAR,
+                                    get_color_attr(color),
+                                )
+                                cell_drawn = True
+                                break
+                    if cell_drawn:
+                        break
+                # Ghost piece
+                if not cell_drawn and GHOST_ENABLED and ghost_y != y:
+                    for pr in range(len(shape)):
+                        for pc in range(len(shape[0])):
+                            if shape[pr][pc]:
+                                if r == ghost_y + pr and c == x + pc:
+                                    ghost_attr = get_color_attr(9)
+                                    if GHOST_DIM:
+                                        ghost_attr |= curses.A_DIM
+                                    stdscr.addstr(
+                                        offset_y + r + 1,
+                                        offset_x + c * BLOCK_SIZE + 1,
+                                        BLOCK_CHAR,
+                                        ghost_attr,
+                                    )
+                                    cell_drawn = True
+                                    break
+                        if cell_drawn:
+                            break
+                # Locked cells / empty
+                if not cell_drawn:
+                    if board[r][c]:
+                        cell_color = board[r][c]
+                        stdscr.addstr(
+                            offset_y + r + 1,
+                            offset_x + c * BLOCK_SIZE + 1,
+                            BLOCK_CHAR,
+                            get_color_attr(cell_color),
+                        )
+                    else:
+                        stdscr.addstr(
+                            offset_y + r + 1,
+                            offset_x + c * BLOCK_SIZE + 1,
+                            EMPTY_CHAR,
+                        )
+            stdscr.addstr(offset_y + r + 1, offset_x + field_width - 1, WALL_CHAR)
+        
+        # Bottom border
+        stdscr.addstr(offset_y + HEIGHT + 1, offset_x, top_border)
+    except curses.error:
+        pass
+
+# ============== MAIN DRAW FUNCTION ==============
+
 def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_piece_name, 
          held_shape, held_piece_name, can_hold, color, spin_message, total_lines, 
-         total_lines_sent, ko_count, speed_level, leaderboard, messages, keybinds):
-    """Draw the game state centered on screen."""
+         total_lines_sent, ko_count, speed_level, leaderboard, messages, keybinds,
+         remote_states=None, left_player=None, right_player=None):
+    """Draw the full frame: local board centered, optional remote boards left/right."""
     max_y, max_x = stdscr.getmaxyx()
     
     field_width = WIDTH * BLOCK_SIZE + 2
@@ -830,61 +1095,25 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
     offset_x = max((max_x - total_width) // 2 + garbage_indicator_width, garbage_indicator_width)
     offset_y = max((max_y - field_height - 7) // 2, 2)
     
-    ghost_y = get_ghost_y(board, shape, x, y) if GHOST_ENABLED else y
-    
     try:
         stdscr.erase()
         
+        # Title
         title_x = offset_x + (field_width - len(TITLE_TEXT)) // 2
         stdscr.addstr(offset_y - 2, title_x, TITLE_TEXT, curses.A_BOLD | get_color_attr(1))
         
-        top_border = WALL_CHAR * field_width
-        stdscr.addstr(offset_y, offset_x, top_border)
+        # Local board (center)
+        draw_board_area(stdscr, board, shape, x, y, color, offset_x, offset_y)
         
-        for r in range(HEIGHT):
-            stdscr.addstr(offset_y + r + 1, offset_x, WALL_CHAR)
-            for c in range(WIDTH):
-                cell_drawn = False
-                for pr in range(len(shape)):
-                    for pc in range(len(shape[0])):
-                        if shape[pr][pc]:
-                            if r == y + pr and c == x + pc:
-                                stdscr.addstr(offset_y + r + 1, offset_x + c * BLOCK_SIZE + 1, BLOCK_CHAR, get_color_attr(color))
-                                cell_drawn = True
-                                break
-                    if cell_drawn:
-                        break
-                if not cell_drawn and GHOST_ENABLED and ghost_y != y:
-                    for pr in range(len(shape)):
-                        for pc in range(len(shape[0])):
-                            if shape[pr][pc]:
-                                if r == ghost_y + pr and c == x + pc:
-                                    ghost_attr = get_color_attr(9)
-                                    if GHOST_DIM:
-                                        ghost_attr |= curses.A_DIM
-                                    stdscr.addstr(offset_y + r + 1, offset_x + c * BLOCK_SIZE + 1, BLOCK_CHAR, ghost_attr)
-                                    cell_drawn = True
-                                    break
-                        if cell_drawn:
-                            break
-                if not cell_drawn:
-                    if board[r][c]:
-                        cell_color = board[r][c]
-                        stdscr.addstr(offset_y + r + 1, offset_x + c * BLOCK_SIZE + 1, BLOCK_CHAR, get_color_attr(cell_color))
-                    else:
-                        stdscr.addstr(offset_y + r + 1, offset_x + c * BLOCK_SIZE + 1, EMPTY_CHAR)
-            stdscr.addstr(offset_y + r + 1, offset_x + field_width - 1, WALL_CHAR)
-        
-        stdscr.addstr(offset_y + HEIGHT + 1, offset_x, top_border)
-        
+        # Garbage indicator for local
         draw_garbage_indicator(stdscr, garbage_info, offset_x, offset_y)
         
+        # Previews and stats
         preview_col = offset_x + field_width + 2
         hold_title = f"HOLD ({key_name(keybinds.get('hold'))})"
         draw_preview(stdscr, held_shape, held_piece_name, offset_y, preview_col, hold_title)
         draw_preview(stdscr, next_shape, next_piece_name, offset_y + 8, preview_col, "NEXT")
         
-        # Stats display
         stats_y = offset_y + 16
         ko_mult = get_ko_multiplier(ko_count)
         stdscr.addstr(stats_y, preview_col, f"Lines Sent: {total_lines_sent}")
@@ -904,7 +1133,37 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
             else:
                 stdscr.addstr(row_y, leaderboard_col, rank_text)
         
-        # Info below game
+        # Remote boards (full-size, same drawing path)
+        if remote_states:
+            # Left remote
+            if left_player and left_player in remote_states:
+                left_state = remote_states[left_player]
+                left_board = left_state["board"]
+                lp = left_state["piece"]
+                lr = left_state["rotation"]
+                lx = left_state["x"]
+                ly = left_state["y"]
+                lshape = rotate_piece(TETROMINOES.get(lp, TETROMINOES["I"]), lr)
+                lcolor = COLORS.get(lp, COLORS["garbage"])
+                left_offset_x = offset_x - field_width - garbage_indicator_width - 4
+                if left_offset_x >= 0:
+                    draw_board_area(stdscr, left_board, lshape, lx, ly, lcolor, left_offset_x, offset_y)
+            
+            # Right remote
+            if right_player and right_player in remote_states and right_player != left_player:
+                right_state = remote_states[right_player]
+                rboard = right_state["board"]
+                rp = right_state["piece"]
+                rr = right_state["rotation"]
+                rx = right_state["x"]
+                ry = right_state["y"]
+                rshape = rotate_piece(TETROMINOES.get(rp, TETROMINOES["I"]), rr)
+                rcolor = COLORS.get(rp, COLORS["garbage"])
+                right_offset_x = leaderboard_col + leaderboard_width + 2
+                if right_offset_x + field_width <= max_x:
+                    draw_board_area(stdscr, rboard, rshape, rx, ry, rcolor, right_offset_x, offset_y)
+        
+        # Info below main game
         info_y = offset_y + HEIGHT + 3
         total_queued = sum(entry[0] for entry in garbage_info)
         stdscr.addstr(info_y, offset_x, f"Player: {PLAYER}  Lines: {total_lines}  Sent: {total_lines_sent}  KOs: {ko_count}  ")
@@ -921,6 +1180,12 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
             stdscr.addstr(info_y + 2, offset_x, " " * 30)
         
         controls = format_controls(keybinds, can_hold)
+        # Show cycle keys if available and multiple remote players
+        if remote_states and len(remote_states) > 2:
+            cycle_left_key = key_name(keybinds.get("cycle_left"))
+            cycle_right_key = key_name(keybinds.get("cycle_right"))
+            if keybinds.get("cycle_left") and keybinds.get("cycle_right"):
+                controls += f" {cycle_left_key}/{cycle_right_key}=Cycle"
         stdscr.addstr(info_y + 3, offset_x, controls)
         
         # Messages (garbage + KO)
@@ -930,7 +1195,6 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
             if msg_y + i < max_y - 1:
                 try:
                     display_msg = msg[:offset_x - 6] if len(msg) > offset_x - 6 else msg
-                    # KO messages in green, garbage in red
                     msg_color = 4 if "KO" in msg else 5
                     stdscr.addstr(msg_y + i, 1, display_msg, get_color_attr(msg_color))
                 except curses.error:
@@ -940,6 +1204,8 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
         pass
     
     stdscr.refresh()
+
+# ============== MAIN LOOP ==============
 
 def main(stdscr):
     global garbage_queue, last_read_time, last_clear_was_line, COLORS_INITIALIZED
@@ -972,6 +1238,13 @@ def main(stdscr):
     total_lines_sent = 0
     ko_count = 0
     last_ko_check = time.time()
+    last_state_publish = time.time()
+    
+    # Remote player state / view selection
+    remote_states = {}
+    remote_players = []
+    left_index = 0
+    right_index = 1
     
     def refill_bag():
         piece_names = list(TETROMINOES.keys())
@@ -1012,7 +1285,7 @@ def main(stdscr):
     
     lock_delay_start = None
     lock_delay_resets = 0
-    last_rotation_was_spin = False  # Track if last rotation could be a T-spin
+    last_rotation_was_spin = False
     is_hard_drop = False
     
     def spawn_new_piece():
@@ -1046,18 +1319,23 @@ def main(stdscr):
     while True:
         current_time = time.time()
         
-        # Calculate current speed
+        # Speed level
         current_tick = get_current_tick(total_lines)
         speed_level = get_speed_level(total_lines)
         
         if spin_message and current_time - spin_message_time > SPIN_MESSAGE_DURATION:
             spin_message = ""
         
-        # Check for KOs periodically
+        # KOs
         if current_time - last_ko_check >= KO_CHECK_INTERVAL:
             last_ko_check = current_time
             new_kos = check_deaths(ko_count)
             ko_count += new_kos
+        
+        # Publish game state periodically
+        if current_time - last_state_publish >= STATE_PUBLISH_INTERVAL:
+            last_state_publish = current_time
+            publish_game_state(board, current_piece_name, current_rotation, x, y)
         
         key = stdscr.getch()
         soft_drop_active = False
@@ -1079,7 +1357,6 @@ def main(stdscr):
             if result:
                 shape, x, y, current_rotation, _ = result
                 moved_or_rotated = True
-                # Check if this rotation qualifies as T-spin
                 if current_piece_name == "T":
                     last_rotation_was_spin = check_tspin(board, x, y)
                 else:
@@ -1125,6 +1402,18 @@ def main(stdscr):
             lock_delay_resets = 0
             last_rotation_was_spin = False
         
+        # Cycle remote views
+        if key == keybinds.get("cycle_left") and remote_players:
+            n = len(remote_players)
+            left_index = (left_index + 1) % n
+            if n > 1 and left_index == right_index:
+                left_index = (left_index + 1) % n
+        if key == keybinds.get("cycle_right") and remote_players:
+            n = len(remote_players)
+            right_index = (right_index + 1) % n
+            if n > 1 and right_index == left_index:
+                right_index = (right_index + 1) % n
+        
         if moved_or_rotated and lock_delay_start is not None and lock_delay_resets < LOCK_DELAY_RESETS:
             lock_delay_start = current_time
             lock_delay_resets += 1
@@ -1139,8 +1428,6 @@ def main(stdscr):
                 y += 1
                 if lock_delay_start is not None:
                     lock_delay_start = None
-                # Moving down invalidates T-spin (unless it was the last action)
-                # We keep last_rotation_was_spin as is - it's only valid if rotation was last
             else:
                 if lock_delay_start is None:
                     lock_delay_start = current_time
@@ -1151,7 +1438,6 @@ def main(stdscr):
             should_lock = True
         
         if should_lock:
-            # For T-piece, check T-spin right before locking
             is_tspin = False
             if current_piece_name == "T":
                 is_tspin = check_tspin(board, x, y) and last_rotation_was_spin
@@ -1160,13 +1446,9 @@ def main(stdscr):
             board, cleared = clear_lines(board)
             total_lines += cleared
             
-            # Calculate garbage with T-spin bonus
             base_garbage = calculate_garbage(cleared, is_tspin, last_clear_was_line)
-            
-            # Apply KO multiplier
             garbage_to_send = apply_ko_multiplier(base_garbage, ko_count) if base_garbage > 0 else 0
             
-            # Set spin message
             if is_tspin and cleared > 0:
                 spin_names = {1: "SINGLE", 2: "DOUBLE", 3: "TRIPLE"}
                 spin_message = f"T-SPIN {spin_names.get(cleared, '')} (+{garbage_to_send})"
@@ -1193,6 +1475,9 @@ def main(stdscr):
             process_garbage_queue_on_placement()
             apply_ready_garbage(board)
             
+            # Publish immediate state after lock
+            publish_game_state(board, current_piece_name, current_rotation, x, y)
+            
             if not spawn_new_piece():
                 signal_death()
                 save_highscore(total_lines_sent, ko_count)
@@ -1203,6 +1488,23 @@ def main(stdscr):
             garbage_list = check_garbage()
             for amount, sender in garbage_list:
                 queue_garbage(amount, sender)
+            
+            # Update remote states on same cadence
+            remote_states = get_remote_states()
+            remote_players = sorted(remote_states.keys())
+            n = len(remote_players)
+            if n == 0:
+                left_index = 0
+                right_index = 1
+            elif n == 1:
+                left_index = right_index = 0
+            else:
+                if left_index >= n:
+                    left_index = 0
+                if right_index >= n:
+                    right_index = 1 if 1 < n else 0
+                if left_index == right_index:
+                    right_index = (left_index + 1) % n
         
         if current_time - last_leaderboard_refresh >= LEADERBOARD_REFRESH:
             last_leaderboard_refresh = current_time
@@ -1210,10 +1512,15 @@ def main(stdscr):
         
         garbage_display = get_garbage_display_info()
         messages = get_active_messages()
+        
+        left_player = remote_players[left_index] if remote_players and left_index < len(remote_players) else None
+        right_player = remote_players[right_index] if remote_players and right_index < len(remote_players) else None
+        
         draw(stdscr, board, shape, current_piece_name, x, y, garbage_display, 
              next_shape, next_piece_name, held_shape, held_piece_name, 
              can_hold, current_color, spin_message, total_lines, 
-             total_lines_sent, ko_count, speed_level, leaderboard, messages, keybinds)
+             total_lines_sent, ko_count, speed_level, leaderboard, messages, keybinds,
+             remote_states, left_player, right_player)
         
         time.sleep(LOOP_SLEEP)
 
