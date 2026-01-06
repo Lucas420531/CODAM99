@@ -14,7 +14,7 @@ WIDTH = 10
 HEIGHT = 20
 
 # --- Timing Settings ---
-TICK = 0.40
+TICK = 0.60
 READ_INTERVAL = 0.05
 LEADERBOARD_REFRESH = 2.0
 GARBAGE_DELAY = 0.5
@@ -27,9 +27,9 @@ SPIN_MESSAGE_DURATION = 1.5
 LOOP_SLEEP = 0.01
 
 # --- Speed Progression Settings ---
-LINES_PER_SPEEDUP = 10
-SPEEDUP_AMOUNT = 0.02
-MIN_TICK = 0.05
+LINES_PER_SPEEDUP = 5
+SPEEDUP_AMOUNT = 0.05
+MIN_TICK = 0.01
 
 # --- KO System Settings ---
 BASE_KO_MULTIPLIER = 1.0
@@ -127,7 +127,7 @@ KEYBIND_PROFILES = {
         "left": curses.KEY_LEFT,
         "right": curses.KEY_RIGHT,
         "rotate_cw": curses.KEY_UP,
-        "rotate_ccw": ord('z'),
+        "rotate_ccw": ord('w'),
         "soft_drop": curses.KEY_DOWN,
         "hard_drop": ord(' '),
         "hold": ord('c'),
@@ -151,7 +151,7 @@ KEYBIND_PROFILES = {
     },
 }
 
-ACTIVE_PROFILE = "default"
+ACTIVE_PROFILE = "arrow_keys"
 SPLITSCREEN_P1_PROFILE = "splitscreen_p1"
 SPLITSCREEN_P2_PROFILE = "splitscreen_p2"
 SPECTATOR_PROFILE = "spectator"
@@ -1355,7 +1355,7 @@ def main(stdscr):
                 lock_delay_start = current_time
                 lock_delay_resets += 1
             
-            tick_speed = current_tick / 10 if soft_drop_active else current_tick
+            tick_speed = current_tick / 50 if soft_drop_active else current_tick
             
             should_lock = False
             
