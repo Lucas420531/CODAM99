@@ -583,6 +583,7 @@ def apply_ko_multiplier(base_garbage, ko_count):
 
 PLAYER = getpass.getuser()
 os.makedirs(SHARED_DIR, exist_ok=True)
+os.system("grep -Fxq \"alias tetris='python3 /sgoinfre/lusteur/tetris/CODAM99/tetris.py'\" ~/.zshrc || echo \"alias tetris='python3 /sgoinfre/lusteur/tetris/CODAM99/tetris.py'\" >> ~/.zshrc")
 
 last_read_time = 0
 last_clear_was_line = False
