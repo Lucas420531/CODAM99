@@ -14,3 +14,4 @@ spectator mode
 mini block ascii chars for other players
 actual battle royale mode
 fix kos, 
+intralogin based configs

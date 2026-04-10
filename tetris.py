@@ -51,7 +51,10 @@ REMOTE_BOARD_SPACING = 4
 BLOCK_SIZE = 2
 BLOCK_CHAR = "██"
 EMPTY_CHAR = "  "
-WALL_CHAR = "#"
+WALL_CHAR = "▒"
+TOP_CHAR = "▄"
+BOT_CHAR = "▀"
+GHOST_CHAR = "##"
 BORDER_H_CHAR = "-"
 BORDER_V_CHAR = "|"
 CORNER_CHAR = "+"
@@ -92,11 +95,13 @@ KEYBIND_PROFILES = {
 
 ACTIVE_PROFILE = "arrow_keys"
 
+BRIGHT_YELLOW = 20
+
 # --- Color Configuration ---
 USE_COLORS = True
 COLOR_PAIRS = {
     1: (curses.COLOR_CYAN, -1),
-    2: (curses.COLOR_YELLOW, -1),
+    2: (BRIGHT_YELLOW, -1),
     3: (curses.COLOR_MAGENTA, -1),
     4: (curses.COLOR_GREEN, -1),
     5: (curses.COLOR_RED, -1),
@@ -1019,9 +1024,8 @@ def draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost
                 target_text = "◆ TARGET ◆"
                 target_x = offset_x + (field_width - len(target_text)) // 2
                 stdscr.addstr(offset_y - 2, target_x, target_text, curses.A_BOLD | get_color_attr(5))
-        
-        top_border = WALL_CHAR * field_width
-        stdscr.addstr(offset_y, offset_x, top_border)
+
+        stdscr.addstr(offset_y, offset_x, TOP_CHAR * field_width)
         ghost_y = get_ghost_y(board, shape, x, y) if (show_ghost and GHOST_ENABLED and not is_dead) else y
         
         for r in range(HEIGHT):
@@ -1048,7 +1052,7 @@ def draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost
                                     ghost_attr = get_color_attr(9)
                                     if GHOST_DIM:
                                         ghost_attr |= curses.A_DIM
-                                    stdscr.addstr(cell_y, cell_x, BLOCK_CHAR, ghost_attr)
+                                    stdscr.addstr(cell_y, cell_x, GHOST_CHAR, ghost_attr)
                                     cell_drawn = True
                                     break
                             if cell_drawn:
@@ -1066,7 +1070,7 @@ def draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost
             
             stdscr.addstr(offset_y + r + 1, offset_x + field_width - 1, WALL_CHAR)
         
-        stdscr.addstr(offset_y + HEIGHT + 1, offset_x, top_border)
+        stdscr.addstr(offset_y + HEIGHT + 1, offset_x, BOT_CHAR * field_width)
     except curses.error:
         pass
 
@@ -1268,6 +1272,7 @@ def main(stdscr):
     if not COLORS_INITIALIZED:
         curses.start_color()
         curses.use_default_colors()
+        curses.init_color(BRIGHT_YELLOW, 1000, 750, 0)
         if USE_COLORS:
             for pair_num, (fg, bg) in COLOR_PAIRS.items():
                 try:
