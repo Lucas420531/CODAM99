@@ -76,11 +76,11 @@ KEYBIND_PROFILES = {
         "cycle_target_back": ord(']'),
     },
     "arrow_keys": {
-        "left": curses.KEY_LEFT,
-        "right": curses.KEY_RIGHT,
-        "rotate_cw": curses.KEY_UP,
+        "left": ord('h'),
+        "right": ord('l'),
+        "rotate_cw": ord('k'),
         "rotate_ccw": ord('w'),
-        "soft_drop": curses.KEY_DOWN,
+        "soft_drop": ord('j'),
         "hard_drop": ord(' '),
         "hold": ord('c'),
         "quit": ord('q'),
@@ -221,7 +221,6 @@ PLAYER = get_safe_player_id()
 DISPLAY_NAME = getpass.getuser()
 
 os.makedirs(SHARED_DIR, exist_ok=True)
-os.system("grep -Fxq \"alias tetris='python3 /sgoinfre/lusteur/tetris/CODAM99/tetris.py'\" ~/.zshrc || echo \"alias tetris='python3 /sgoinfre/lusteur/tetris/CODAM99/tetris.py'\" >> ~/.zshrc")
 
 # ============== UNIFIED STATE FILE SYSTEM ==============
 # Format: state_{PLAYER}_{timestamp}_{isDead}_{target}_{garbageToTarget}_{encoded}.txt

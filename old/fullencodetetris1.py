@@ -28,7 +28,7 @@ LOOP_SLEEP = 0.01
 
 # --- Speed Progression Settings ---
 LINES_PER_SPEEDUP = 5
-SPEEDUP_AMOUNT = 0.02
+SPEEDUP_AMOUNT = 0.05
 MIN_TICK = 0.01
 
 # --- KO System Settings ---
@@ -43,7 +43,7 @@ GARBAGE_BUFFER_PIECES = 3
 STATE_PUBLISH_INTERVAL = 0.1
 STATE_STALE_TIMEOUT = 2.0
 STATE_CLEANUP_TIMEOUT = 5.0
-DEAD_STATE_CLEANUP_TIMEOUT = 30.0
+DEAD_STATE_CLEANUP_TIMEOUT = 30.0  # Keep dead player states longer so others can see
 SHOW_REMOTE_PLAYERS = True
 REMOTE_BOARD_SPACING = 4
 
@@ -72,25 +72,88 @@ KEYBIND_PROFILES = {
         "hold": ord('c'),
         "quit": ord('q'),
         "pause": None,
-        "cycle_target": ord('['),
-        "cycle_target_back": ord(']'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
+    },
+    "spectator": {
+        "next_player": ord('d'),
+        "prev_player": ord('a'),
+        "toggle_auto": ord('t'),
+        "zoom_in": ord('w'),
+        "zoom_out": ord('s'),
+        "quit": ord('q'),
+    },
+    "multiplayer": {
+        "left": ord('a'),
+        "right": ord('d'),
+        "rotate_cw": ord('w'),
+        "rotate_ccw": ord('e'),
+        "soft_drop": ord('s'),
+        "hard_drop": ord(' '),
+        "hold": ord('c'),
+        "quit": ord('q'),
+        "pause": None,
+        "target_next": ord('e'),
+        "target_prev": ord('r'),
+        "target_random": ord('t'),
+        "target_attacker": ord('y'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
+    },
+    "splitscreen_p1": {
+        "left": ord('a'),
+        "right": ord('d'),
+        "rotate_cw": ord('w'),
+        "rotate_ccw": ord('q'),
+        "soft_drop": ord('s'),
+        "hard_drop": ord(' '),
+        "hold": ord('c'),
+        "quit": ord('`'),
+        "pause": ord('p'),
+    },
+    "splitscreen_p2": {
+        "left": ord('j'),
+        "right": ord('l'),
+        "rotate_cw": ord('i'),
+        "rotate_ccw": ord('u'),
+        "soft_drop": ord('k'),
+        "hard_drop": ord('\n'),
+        "hold": ord('/'),
+        "quit": ord('\\'),
+        "pause": ord('p'),
     },
     "arrow_keys": {
         "left": curses.KEY_LEFT,
         "right": curses.KEY_RIGHT,
         "rotate_cw": curses.KEY_UP,
-        "rotate_ccw": ord('w'),
+        "rotate_ccw": ord('z'),
         "soft_drop": curses.KEY_DOWN,
         "hard_drop": ord(' '),
         "hold": ord('c'),
         "quit": ord('q'),
         "pause": ord('p'),
-        "cycle_target": ord('['),
-        "cycle_target_back": ord(']'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
+    },
+    "vim": {
+        "left": ord('h'),
+        "right": ord('l'),
+        "rotate_cw": ord('k'),
+        "rotate_ccw": ord('j'),
+        "soft_drop": ord('j'),
+        "hard_drop": ord(' '),
+        "hold": ord('f'),
+        "quit": ord('q'),
+        "pause": ord('p'),
+        "cycle_left": ord('['),
+        "cycle_right": ord(']'),
     },
 }
 
 ACTIVE_PROFILE = "arrow_keys"
+SPLITSCREEN_P1_PROFILE = "splitscreen_p1"
+SPLITSCREEN_P2_PROFILE = "splitscreen_p2"
+SPECTATOR_PROFILE = "spectator"
 
 # --- Color Configuration ---
 USE_COLORS = True
@@ -128,7 +191,6 @@ KO_MESSAGES = [
 # ============== END CONFIG ==================
 
 PIECE_NAMES = ["I", "O", "T", "S", "Z", "J", "L"]
-
 
 def encode_game_state(board, piece_name, rotation, piece_x, piece_y):
     bits = []
@@ -223,24 +285,20 @@ DISPLAY_NAME = getpass.getuser()
 os.makedirs(SHARED_DIR, exist_ok=True)
 os.system("grep -Fxq \"alias tetris='python3 /sgoinfre/lusteur/tetris/CODAM99/tetris.py'\" ~/.zshrc || echo \"alias tetris='python3 /sgoinfre/lusteur/tetris/CODAM99/tetris.py'\" >> ~/.zshrc")
 
+
 # ============== UNIFIED STATE FILE SYSTEM ==============
-# Format: state_{PLAYER}_{timestamp}_{isDead}_{target}_{garbageToTarget}_{encoded}.txt
+# Format: state_{PLAYER}_{timestamp}_{isDead}_{cumulativeGarbage}_{encoded}.txt
 #
 # isDead: 0 = alive, 1 = dead
-# target: current target player name (or "none")
-# garbageToTarget: cumulative garbage sent to current target
+# cumulativeGarbage: total garbage sent this session (never decreases)
+#
+# This replaces separate garbage_*.txt and death_*.txt files
 
-# Track garbage we've received from each player (cumulative per-sender)
+# Track garbage received from each player (cumulative)
 _received_garbage_from = {}
 
-# Track the initial garbage count when we first saw each player (to avoid receiving old garbage)
-_player_initial_garbage = {}
-
-# Track players we've already counted as KOs from us
-_players_we_kod = set()
-
-# Track garbage ownership in our board (list of sender names per garbage row, bottom-up)
-_garbage_row_owners = []  # List of sender names for garbage rows
+# Track players we've already counted as KOs
+_known_dead_players = set()
 
 # Cache for remote player states
 _remote_state_cache = {}
@@ -250,15 +308,11 @@ _remote_state_timestamps = {}
 garbage_messages = []
 ko_messages = []
 
-# Our session start time (to ignore garbage from before we joined)
-_session_start_time = time.time()
 
-
-def publish_game_state(board, piece_name, rotation, piece_x, piece_y, is_dead=False, 
-                       target_player="none", garbage_to_target=0, attackers_garbage=None):
+def publish_game_state(board, piece_name, rotation, piece_x, piece_y, is_dead=False, cumulative_garbage=0):
     """
     Publish encoded game state to shared filesystem.
-    attackers_garbage: dict of {attacker_name: cumulative_garbage_received}
+    Includes death status and cumulative garbage sent for other players to read.
     """
     try:
         # Clean old state files for this player
@@ -273,19 +327,8 @@ def publish_game_state(board, piece_name, rotation, piece_x, piece_y, is_dead=Fa
         timestamp = time.time()
         dead_flag = 1 if is_dead else 0
         
-        # Encode attackers_garbage as comma-separated "name:amount" pairs
-        attackers_str = ""
-        if attackers_garbage:
-            pairs = [f"{k}:{v}" for k, v in attackers_garbage.items()]
-            attackers_str = ",".join(pairs)
-        if not attackers_str:
-            attackers_str = "x"  # placeholder for empty
-        
-        # Sanitize target name for filename
-        safe_target = target_player.replace('_', '-') if target_player else "none"
-        
-        # Format: state_{PLAYER}_{timestamp}_{isDead}_{target}_{garbageToTarget}_{attackers}_{encoded}.txt
-        filename = f"state_{PLAYER}_{timestamp}_{dead_flag}_{safe_target}_{garbage_to_target}_{attackers_str}_{encoded}.txt"
+        # Format: state_{PLAYER}_{timestamp}_{isDead}_{cumulativeGarbage}_{encoded}.txt
+        filename = f"state_{PLAYER}_{timestamp}_{dead_flag}_{cumulative_garbage}_{encoded}.txt"
         open(f"{SHARED_DIR}/{filename}", "w").close()
     except:
         pass
@@ -307,7 +350,7 @@ def cleanup_state_file():
 def get_remote_player_states():
     """
     Read all other players' game states from shared filesystem.
-    Returns dict: player_name -> decoded_state
+    Returns dict: player_name -> decoded_state (includes is_dead, cumulative_garbage)
     """
     global _remote_state_cache, _remote_state_timestamps
     current_time = time.time()
@@ -318,36 +361,28 @@ def get_remote_player_states():
         for fname in files:
             if fname.startswith("state_") and fname.endswith(".txt"):
                 try:
-                    # Parse: state_{player}_{timestamp}_{isDead}_{target}_{garbageToTarget}_{attackers}_{encoded}.txt
-                    base = fname[:-4]
-                    parts = base.split("_", 6)
+                    # Parse: state_{player}_{timestamp}_{isDead}_{cumGarbage}_{encoded}.txt
+                    base = fname[:-4]  # Remove .txt
+                    parts = base.split("_", 4)  # Split into: state, player, timestamp, isDead, rest
                     
-                    if len(parts) >= 7:
+                    if len(parts) >= 5:
                         player_name = parts[1]
                         timestamp = float(parts[2])
                         is_dead = (parts[3] == "1")
-                        target = parts[4] if parts[4] != "none" else None
-                        garbage_to_target = int(parts[5])
                         
-                        # Parse attackers string
-                        attackers_str = parts[6].split("_")[0]  # Get part before encoded
-                        attackers_garbage = {}
-                        if attackers_str and attackers_str != "x":
-                            for pair in attackers_str.split(","):
-                                if ":" in pair:
-                                    name, amt = pair.split(":", 1)
-                                    try:
-                                        attackers_garbage[name] = int(amt)
-                                    except:
-                                        pass
-                        
-                        # Get encoded part (everything after attackers)
-                        rest_parts = parts[6].split("_", 1)
-                        encoded = rest_parts[1] if len(rest_parts) > 1 else ""
+                        # The rest contains cumGarbage and encoded, split once more
+                        rest = parts[4]
+                        rest_parts = rest.split("_", 1)
+                        if len(rest_parts) >= 2:
+                            cumulative_garbage = int(rest_parts[0])
+                            encoded = rest_parts[1]
+                        else:
+                            continue
 
                         if player_name == PLAYER:
                             continue
 
+                        # Use different timeout for dead players
                         timeout = DEAD_STATE_CLEANUP_TIMEOUT if is_dead else STATE_STALE_TIMEOUT
                         cleanup_timeout = DEAD_STATE_CLEANUP_TIMEOUT if is_dead else STATE_CLEANUP_TIMEOUT
 
@@ -364,10 +399,9 @@ def get_remote_player_states():
                             state['player_name'] = player_name
                             state['timestamp'] = timestamp
                             state['is_dead'] = is_dead
-                            state['target'] = target
-                            state['garbage_to_target'] = garbage_to_target
-                            state['attackers_garbage'] = attackers_garbage
+                            state['cumulative_garbage'] = cumulative_garbage
                             
+                            # Keep most recent state per player
                             if player_name not in fresh_states or timestamp > fresh_states[player_name]['timestamp']:
                                 fresh_states[player_name] = state
                 except:
@@ -375,12 +409,14 @@ def get_remote_player_states():
     except:
         pass
 
+    # Update cache with fresh states
     for player, state in fresh_states.items():
         cached_ts = _remote_state_timestamps.get(player, 0)
         if state['timestamp'] >= cached_ts:
             _remote_state_cache[player] = state
             _remote_state_timestamps[player] = state['timestamp']
 
+    # Remove stale players from cache
     stale_players = []
     for player in list(_remote_state_cache.keys()):
         cached_ts = _remote_state_timestamps.get(player, 0)
@@ -399,33 +435,20 @@ def get_remote_player_states():
     return _remote_state_cache.copy()
 
 
-def process_incoming_garbage(remote_states, my_name):
+def process_incoming_garbage(remote_states):
     """
-    Check remote states for new garbage targeted at us.
+    Check remote states for new garbage to receive.
     Uses cumulative garbage tracking to ensure we receive each garbage send exactly once.
-    Only receives garbage from players who are targeting us.
     Returns list of (amount, sender) tuples for new garbage.
     """
-    global _received_garbage_from, _player_initial_garbage
+    global _received_garbage_from
     garbage_list = []
     
     for player, state in remote_states.items():
         if state.get('is_dead', False):
             continue
-        
-        # Only receive garbage if this player is targeting us
-        if state.get('target') != my_name:
-            continue
-        
-        cumulative = state.get('garbage_to_target', 0)
-        
-        # If this is the first time seeing this player, initialize to their current cumulative
-        # This prevents receiving old garbage when joining late
-        if player not in _player_initial_garbage:
-            _player_initial_garbage[player] = cumulative
-            _received_garbage_from[player] = cumulative
-            continue
-        
+            
+        cumulative = state.get('cumulative_garbage', 0)
         last_received = _received_garbage_from.get(player, 0)
         
         if cumulative > last_received:
@@ -436,57 +459,47 @@ def process_incoming_garbage(remote_states, my_name):
     return garbage_list
 
 
-def check_for_kos(remote_states, my_garbage_in_players):
+def process_deaths(remote_states, current_ko_count):
     """
-    Check if any player died with our garbage in their board.
-    my_garbage_in_players: dict of player_name -> amount of our garbage they've received
-    Returns list of newly KO'd player names.
+    Check remote states for newly dead players.
+    Returns number of new KOs.
     """
-    global _players_we_kod, ko_messages
-    new_kos = []
+    global _known_dead_players, ko_messages
+    new_kos = 0
     
     for player, state in remote_states.items():
-        if not state.get('is_dead', False):
-            continue
-        if player in _players_we_kod:
-            continue
-        
-        # Check if this player has received garbage from us (check their attackers_garbage)
-        attackers = state.get('attackers_garbage', {})
-        if PLAYER in attackers and attackers[PLAYER] > 0:
-            # They had our garbage when they died - we get the KO!
-            _players_we_kod.add(player)
-            new_kos.append(player)
+        if state.get('is_dead', False) and player not in _known_dead_players:
+            _known_dead_players.add(player)
+            new_kos += 1
+            msg = random.choice(KO_MESSAGES).format(player=player, kos=current_ko_count + new_kos)
+            ko_messages.append((msg, time.time() + MESSAGE_DISPLAY_TIME))
     
     return new_kos
 
 
-def count_players_targeting_me(remote_states, my_name):
-    """Count how many alive players are targeting us."""
-    count = 0
-    for player, state in remote_states.items():
-        if state.get('is_dead', False):
-            continue
-        if state.get('target') == my_name:
-            count += 1
-    return count
-
-
 def cleanup_old_files():
-    """Clean up old files from previous versions."""
+    """
+    Clean up old garbage and death files from previous versions.
+    This provides backwards compatibility during transition.
+    """
     current_time = time.time()
     try:
         for fname in os.listdir(SHARED_DIR):
             try:
+                # Clean old garbage files
                 if fname.startswith("garbage_") and fname.endswith(".txt"):
                     fpath = f"{SHARED_DIR}/{fname}"
                     if current_time - os.path.getmtime(fpath) > 60:
                         os.remove(fpath)
+                
+                # Clean old death files
                 if fname.startswith("death_") and fname.endswith(".txt"):
                     fpath = f"{SHARED_DIR}/{fname}"
                     if current_time - os.path.getmtime(fpath) > 60:
                         os.remove(fpath)
-                if fname.startswith(".received_"):
+                
+                # Clean old marker files
+                if fname.startswith(".received_") and fname.endswith(".txt"):
                     fpath = f"{SHARED_DIR}/{fname}"
                     if current_time - os.path.getmtime(fpath) > 60:
                         os.remove(fpath)
@@ -496,98 +509,85 @@ def cleanup_old_files():
         pass
 
 
-class TargetingSystem:
-    """Manages target selection for Tetris 99-style targeting."""
-    
-    def __init__(self):
-        self.target_idx = 0
-        self.player_list = []
-        self.current_target = None
-    
-    def update(self, remote_states):
-        """Update player list with alive players only."""
-        alive_players = [k for k, v in remote_states.items() if not v.get('is_dead', False)]
-        self.player_list = sorted(alive_players)
-        
-        if not self.player_list:
-            self.current_target = None
-            self.target_idx = 0
-        else:
-            # Keep current target if still valid
-            if self.current_target in self.player_list:
-                self.target_idx = self.player_list.index(self.current_target)
-            else:
-                self.target_idx = min(self.target_idx, len(self.player_list) - 1)
-                self.current_target = self.player_list[self.target_idx]
-    
-    def cycle_target(self, direction=1):
-        """Cycle to next/previous target."""
-        if not self.player_list:
-            return
-        self.target_idx = (self.target_idx + direction) % len(self.player_list)
-        self.current_target = self.player_list[self.target_idx]
-    
-    def get_target(self):
-        """Get current target name."""
-        return self.current_target
-    
-    def get_display_player(self):
-        """Get the player to display on the left (same as target)."""
-        return self.current_target
-
-
 class RemotePlayerView:
-    """Manages which remote players to display."""
-    
     def __init__(self):
-        self.right_idx = 0
+        self.left_idx = 0
+        self.right_idx = 1
         self.player_list = []
-    
-    def update(self, states, target_player=None):
-        """Update player list, excluding the target (shown on left)."""
-        alive_players = [k for k, v in states.items() 
-                        if not v.get('is_dead', False) and k != target_player]
-        self.player_list = sorted(alive_players)
-        
-        if self.player_list:
-            self.right_idx = self.right_idx % len(self.player_list)
+
+    def update(self, states):
+        # Only show alive players in the view
+        alive_players = {k: v for k, v in states.items() if not v.get('is_dead', False)}
+        self.player_list = sorted(alive_players.keys())
+        n = len(self.player_list)
+        if n == 0:
+            self.left_idx = 0
+            self.right_idx = 1
         else:
-            self.right_idx = 0
-    
+            self.left_idx = self.left_idx % n
+            self.right_idx = self.right_idx % n if n > 1 else self.left_idx
+            if n > 1 and self.left_idx == self.right_idx:
+                self.right_idx = (self.left_idx + 1) % n
+
+    def cycle_left(self, direction=1):
+        n = len(self.player_list)
+        if n > 0:
+            self.left_idx = (self.left_idx + direction) % n
+            if n > 1 and self.left_idx == self.right_idx:
+                self.left_idx = (self.left_idx + direction) % n
+
     def cycle_right(self, direction=1):
-        """Cycle the right display player."""
-        if self.player_list:
-            self.right_idx = (self.right_idx + direction) % len(self.player_list)
-    
+        n = len(self.player_list)
+        if n > 0:
+            self.right_idx = (self.right_idx + direction) % n
+            if n > 1 and self.right_idx == self.left_idx:
+                self.right_idx = (self.right_idx + direction) % n
+
+    def get_left_player(self):
+        if self.player_list and self.left_idx < len(self.player_list):
+            return self.player_list[self.left_idx]
+        return None
+
     def get_right_player(self):
-        """Get player to show on right side."""
         if self.player_list and self.right_idx < len(self.player_list):
             return self.player_list[self.right_idx]
         return None
 
-
-targeting = TargetingSystem()
 remote_view = RemotePlayerView()
 
 
 def get_keybinds(profile_name=None):
     if profile_name is None:
         profile_name = ACTIVE_PROFILE
-    return KEYBIND_PROFILES.get(profile_name, KEYBIND_PROFILES.get("default", {})).copy()
+    profile = KEYBIND_PROFILES.get(profile_name)
+    if profile is None:
+        profile = KEYBIND_PROFILES.get("default", {})
+    return profile.copy()
 
+def get_splitscreen_keybinds():
+    return (get_keybinds(SPLITSCREEN_P1_PROFILE),
+            get_keybinds(SPLITSCREEN_P2_PROFILE))
 
 def key_name(keycode):
     if keycode is None:
         return "---"
     special_keys = {
-        ord(' '): "SPACE", ord('\n'): "ENTER", ord('\t'): "TAB", 27: "ESC",
-        ord('`'): "`", ord('\\'): "\\", ord('['): "[", ord(']'): "]",
+        ord(' '): "SPACE",
+        ord('\n'): "ENTER",
+        ord('\t'): "TAB",
+        27: "ESC",
+        ord('`'): "`",
+        ord('\\'): "\\",
+        ord('['): "[",
+        ord(']'): "]",
     }
     if keycode in special_keys:
         return special_keys[keycode]
     curses_keys = {
-        curses.KEY_LEFT: "←", curses.KEY_RIGHT: "→",
-        curses.KEY_UP: "↑", curses.KEY_DOWN: "↓",
+        curses.KEY_LEFT: "←",
+        curses.KEY_RIGHT: "→",
+        curses.KEY_UP: "↑",
+        curses.KEY_DOWN: "↓",
     }
     if keycode in curses_keys:
         return curses_keys[keycode]
@@ -595,21 +595,50 @@ def key_name(keycode):
         return chr(keycode).upper()
     return f"[{keycode}]"
 
-
-def format_controls(keybinds, can_hold=True):
+def format_controls(keybinds, can_hold=True, show_cycle=False):
     left = key_name(keybinds.get("left"))
     right = key_name(keybinds.get("right"))
     rotate_cw = key_name(keybinds.get("rotate_cw"))
+    rotate_ccw = key_name(keybinds.get("rotate_ccw"))
     soft = key_name(keybinds.get("soft_drop"))
     hard = key_name(keybinds.get("hard_drop"))
     hold = key_name(keybinds.get("hold"))
     quit_key = key_name(keybinds.get("quit"))
-    cycle = key_name(keybinds.get("cycle_target"))
-    
-    controls = f"{left}/{right}=Move {rotate_cw}=Rot {soft}=Soft {hard}=Hard "
-    controls += f"{hold}=Hold" if can_hold else f"{hold}=Hold(used)"
-    controls += f" {cycle}=Target {quit_key}=Quit"
+    controls = f"{left}/{right}=Move {rotate_cw}/{rotate_ccw}=Rotate {soft}=Soft {hard}=Hard "
+    if keybinds.get("hold") is not None:
+        controls += f"{hold}=Hold(used) " if not can_hold else f"{hold}=Hold "
+    controls += f"{quit_key}=Quit"
+    if show_cycle:
+        cl = key_name(keybinds.get("cycle_left"))
+        cr = key_name(keybinds.get("cycle_right"))
+        controls += f" {cl}/{cr}=Cycle"
     return controls
+
+def validate_keybinds(profile_name):
+    warnings = []
+    keybinds = get_keybinds(profile_name)
+    seen = {}
+    for action, keycode in keybinds.items():
+        if keycode is None:
+            continue
+        if keycode in seen:
+            warnings.append(f"Key conflict: {action}")
+        else:
+            seen[keycode] = action
+    return warnings
+
+def check_splitscreen_conflicts():
+    p1_keys = get_keybinds(SPLITSCREEN_P1_PROFILE)
+    p2_keys = get_keybinds(SPLITSCREEN_P2_PROFILE)
+    conflicts = []
+    p1_codes = {v for v in p1_keys.values() if v is not None}
+    p2_codes = {v for v in p2_keys.values() if v is not None}
+    shared = p1_codes & p2_codes
+    allowed_shared = {p1_keys.get("quit"), p1_keys.get("pause"), p2_keys.get("quit"), p2_keys.get("pause")}
+    for keycode in shared:
+        if keycode not in allowed_shared:
+            conflicts.append(key_name(keycode))
+    return conflicts
 
 
 def get_current_tick(total_lines_cleared):
@@ -617,14 +646,12 @@ def get_current_tick(total_lines_cleared):
     new_tick = TICK - (speedups * SPEEDUP_AMOUNT)
     return max(new_tick, MIN_TICK)
 
-
 def get_speed_level(total_lines_cleared):
     return (total_lines_cleared // LINES_PER_SPEEDUP) + 1
 
 
 def get_ko_multiplier(ko_count):
     return BASE_KO_MULTIPLIER + (ko_count * KO_MULTIPLIER_INCREMENT)
-
 
 def apply_ko_multiplier(base_garbage, ko_count):
     if base_garbage <= 0:
@@ -635,10 +662,8 @@ def apply_ko_multiplier(base_garbage, ko_count):
 
 last_read_time = 0
 last_clear_was_line = False
-garbage_queue = []
 
-# Track garbage we've received from each player (for KO attribution)
-_garbage_received_from = {}  # sender -> total amount received
+garbage_queue = []
 
 # ============= SRS KICK DATA =============
 
@@ -664,6 +689,20 @@ SRS_KICKS_I = {
     (0, 3): [(0, 0), (-1, 0), (2, 0), (-1, 2), (2, -1)],
 }
 
+SRS_KICKS_180_JLSTZ = {
+    (0, 2): [(0, 0), (0, 1), (1, 1), (-1, 1), (1, 0), (-1, 0)],
+    (2, 0): [(0, 0), (0, -1), (-1, -1), (1, -1), (-1, 0), (1, 0)],
+    (1, 3): [(0, 0), (-1, 0), (-1, 1), (-1, -1), (0, 1), (0, -1)],
+    (3, 1): [(0, 0), (1, 0), (1, -1), (1, 1), (0, -1), (0, 1)],
+}
+
+SRS_KICKS_180_I = {
+    (0, 2): [(0, 0), (0, 1)],
+    (2, 0): [(0, 0), (0, -1)],
+    (1, 3): [(0, 0), (-1, 0)],
+    (3, 1): [(0, 0), (1, 0)],
+}
+
 TETROMINOES = {
     "I": [[0,0,0,0], [1,1,1,1], [0,0,0,0], [0,0,0,0]],
     "O": [[1,1],[1,1]],
@@ -680,14 +719,11 @@ COLORS = {
 
 COLORS_INITIALIZED = False
 
-
 def rotate_matrix(shape):
     return [list(row) for row in zip(*shape[::-1])]
 
-
 def rotate_matrix_ccw(shape):
     return [list(row) for row in zip(*shape)][::-1]
-
 
 def rotate_piece(shape, times=1):
     result = [row[:] for row in shape]
@@ -695,10 +731,8 @@ def rotate_piece(shape, times=1):
         result = rotate_matrix(result)
     return result
 
-
 def new_board():
     return [[0]*WIDTH for _ in range(HEIGHT)]
-
 
 def collide(board, shape, x, y):
     for r in range(len(shape)):
@@ -711,13 +745,11 @@ def collide(board, shape, x, y):
                     return True
     return False
 
-
 def lock(board, shape, x, y, color):
     for r in range(len(shape)):
         for c in range(len(shape[0])):
             if shape[r][c] and y+r >= 0:
                 board[y+r][x+c] = color
-
 
 def get_piece_bounds(shape):
     min_r, max_r = len(shape), 0
@@ -730,6 +762,21 @@ def get_piece_bounds(shape):
                 min_c = min(min_c, c)
                 max_c = max(max_c, c)
     return min_r, max_r, min_c, max_c
+
+
+# ============= SPIN DETECTION =============
+
+def count_corners_filled(board, center_x, center_y):
+    corners_filled = 0
+    for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+        check_x, check_y = center_x + dx, center_y + dy
+        if check_x < 0 or check_x >= WIDTH or check_y >= HEIGHT:
+            corners_filled += 1
+        elif check_y < 0:
+            continue
+        elif board[check_y][check_x]:
+            corners_filled += 1
+    return corners_filled
 
 
 def get_front_corners_for_t(rotation):
@@ -786,8 +833,22 @@ def check_spin(board, shape, x, y, piece_name, rotation, kick_idx, rotation_dire
     if kick_idx == 0:
         return None, False
     
-    spin_names = {"S": "S-SPIN", "Z": "Z-SPIN", "I": "I-SPIN", "J": "J-SPIN", "L": "L-SPIN"}
-    return spin_names.get(piece_name), True
+    if piece_name == "S":
+        return "S-SPIN", True
+    
+    if piece_name == "Z":
+        return "Z-SPIN", True
+    
+    if piece_name == "I":
+        return "I-SPIN", True
+    
+    if piece_name == "J":
+        return "J-SPIN", True
+    
+    if piece_name == "L":
+        return "L-SPIN", True
+    
+    return None, False
 
 
 def try_rotation(board, shape, x, y, piece_name, current_rotation, clockwise=True):
@@ -795,9 +856,33 @@ def try_rotation(board, shape, x, y, piece_name, current_rotation, clockwise=Tru
         return None
     
     new_rotation = (current_rotation + (1 if clockwise else 3)) % 4
-    new_shape = rotate_matrix(shape) if clockwise else rotate_matrix_ccw(shape)
+    
+    if clockwise:
+        new_shape = rotate_matrix(shape)
+    else:
+        new_shape = rotate_matrix_ccw(shape)
     
     kick_table = SRS_KICKS_I if piece_name == "I" else SRS_KICKS_JLSTZ
+    kick_key = (current_rotation, new_rotation)
+    kicks = kick_table.get(kick_key, [(0, 0)])
+    
+    for i, (kick_x, kick_y) in enumerate(kicks):
+        new_x = x + kick_x
+        new_y = y + kick_y
+        if not collide(board, new_shape, new_x, new_y):
+            return (new_shape, new_x, new_y, new_rotation, i)
+    
+    return None
+
+
+def try_rotation_180(board, shape, x, y, piece_name, current_rotation):
+    if piece_name == "O":
+        return None
+    
+    new_rotation = (current_rotation + 2) % 4
+    new_shape = rotate_matrix(rotate_matrix(shape))
+    
+    kick_table = SRS_KICKS_180_I if piece_name == "I" else SRS_KICKS_180_JLSTZ
     kick_key = (current_rotation, new_rotation)
     kicks = kick_table.get(kick_key, [(0, 0)])
     
@@ -830,17 +915,18 @@ def calculate_garbage(lines_cleared, spin_type, is_mini, back_to_back, is_perfec
     if lines_cleared == 0:
         return 0
     
-    if is_perfect_clear:
-        return 10
-    
     base_garbage = 0
+    
+    if is_perfect_clear:
+        pc_values = {1: 10, 2: 10, 3: 10, 4: 10}
+        return pc_values.get(lines_cleared, 10)
     
     if spin_type == "T-SPIN":
         if is_mini:
             base_garbage = {1: 0, 2: 1, 3: 2}.get(lines_cleared, 0)
         else:
             base_garbage = {1: 2, 2: 4, 3: 6}.get(lines_cleared, 0)
-    elif spin_type:
+    elif spin_type in ["S-SPIN", "Z-SPIN", "I-SPIN", "J-SPIN", "L-SPIN"]:
         if is_mini:
             base_garbage = {1: 0, 2: 1, 3: 2, 4: 4}.get(lines_cleared, 0)
         else:
@@ -854,18 +940,12 @@ def calculate_garbage(lines_cleared, spin_type, is_mini, back_to_back, is_perfec
     return base_garbage
 
 
-def add_garbage(board, n, sender="Unknown"):
-    """Add garbage lines with one random hole, tracking sender for KO attribution."""
-    global _garbage_received_from
-    
+def add_garbage(board, n):
     for _ in range(n):
         board.pop(0)
         hole_pos = random.randint(0, WIDTH - 1)
         garbage_line = [8 if i != hole_pos else 0 for i in range(WIDTH)]
         board.append(garbage_line)
-    
-    # Track how much garbage we've received from this sender
-    _garbage_received_from[sender] = _garbage_received_from.get(sender, 0) + n
 
 
 def queue_garbage(amount, sender="Unknown"):
@@ -887,23 +967,15 @@ def process_garbage_queue_on_placement():
 def apply_ready_garbage(board):
     global garbage_queue
     total_to_apply = 0
-    senders = []
     new_queue = []
-    
     for entry in garbage_queue:
         if entry[1] <= 0:
             total_to_apply += entry[0]
-            senders.append(entry[2])
         else:
             new_queue.append(entry)
-    
     garbage_queue = new_queue
-    
     if total_to_apply > 0:
-        # Apply garbage and track sender
-        for sender in senders:
-            add_garbage(board, total_to_apply // len(senders), sender)
-    
+        add_garbage(board, total_to_apply)
     return total_to_apply
 
 
@@ -949,10 +1021,12 @@ def save_highscore(lines_sent, ko_count):
             if fname.startswith(f"highscore_{PLAYER}_") and fname.endswith(".txt"):
                 existing_files.append(fname)
                 try:
-                    parts = fname[:-4].split("_")
+                    base = fname[:-4]
+                    parts = base.split("_")
                     if len(parts) >= 4:
-                        existing_best = max(existing_best, int(parts[2]))
-                except:
+                        lines_val = int(parts[2])
+                        existing_best = max(existing_best, lines_val)
+                except (ValueError, IndexError):
                     pass
         if lines_sent > existing_best:
             for f in existing_files:
@@ -973,14 +1047,15 @@ def get_leaderboard():
         for fname in os.listdir(SHARED_DIR):
             if fname.startswith("highscore_") and fname.endswith(".txt"):
                 try:
-                    parts = fname[:-4].split("_")
+                    base = fname[:-4]
+                    parts = base.split("_")
                     if len(parts) >= 5:
                         player = parts[1]
                         lines = int(parts[2])
                         kos = int(parts[3])
                         if player not in scores or lines > scores[player]["lines"]:
                             scores[player] = {"name": player, "lines": lines, "kos": kos}
-                except:
+                except (ValueError, IndexError):
                     pass
     except:
         pass
@@ -993,15 +1068,13 @@ def get_ghost_y(board, shape, x, y):
         ghost_y += 1
     return ghost_y
 
-
 def get_color_attr(color_pair_num):
     if USE_COLORS:
         return curses.color_pair(color_pair_num)
     return 0
 
 
-def draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost=True, 
-               player_name=None, is_dead=False, is_target=False, is_targeting_me=False):
+def draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost=True, player_name=None, is_dead=False):
     field_width = WIDTH * BLOCK_SIZE + 2
     try:
         if player_name:
@@ -1013,12 +1086,6 @@ def draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost
             if is_dead:
                 attr |= curses.A_DIM
             stdscr.addstr(offset_y - 1, name_x, name_display, attr)
-            
-            # Show targeting indicator
-            if is_target and not is_dead:
-                target_text = "◆ TARGET ◆"
-                target_x = offset_x + (field_width - len(target_text)) // 2
-                stdscr.addstr(offset_y - 2, target_x, target_text, curses.A_BOLD | get_color_attr(5))
         
         top_border = WALL_CHAR * field_width
         stdscr.addstr(offset_y, offset_x, top_border)
@@ -1093,7 +1160,6 @@ def draw_preview(stdscr, shape, piece_name, row_offset, col_offset, title):
     except curses.error:
         pass
 
-
 def draw_countdown(stdscr, count):
     max_y, max_x = stdscr.getmaxyx()
     stdscr.clear()
@@ -1108,7 +1174,6 @@ def draw_countdown(stdscr, count):
         stdscr.refresh()
     except curses.error:
         pass
-
 
 def draw_garbage_indicator(stdscr, garbage_info, offset_x, offset_y):
     if not garbage_info:
@@ -1129,13 +1194,14 @@ def draw_garbage_indicator(stdscr, garbage_info, offset_x, offset_y):
 
 
 def get_alive_player_count(remote_states):
+    """Count alive players (excluding self)."""
     return sum(1 for s in remote_states.values() if not s.get('is_dead', False))
 
 
 def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_piece_name,
          held_shape, held_piece_name, can_hold, color, spin_message, total_lines,
          total_lines_sent, ko_count, speed_level, leaderboard, messages, keybinds,
-         remote_states=None, target_player=None, right_player=None, targeting_me_count=0):
+         remote_states=None, left_player=None, right_player=None):
     max_y, max_x = stdscr.getmaxyx()
     field_width = WIDTH * BLOCK_SIZE + 2
     field_height = HEIGHT + 2
@@ -1143,43 +1209,39 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
     leaderboard_width = 28
     garbage_indicator_width = 5
     
-    has_left = SHOW_REMOTE_PLAYERS and remote_states and target_player and target_player in remote_states
+    has_left = SHOW_REMOTE_PLAYERS and remote_states and left_player and left_player in remote_states
     has_right = SHOW_REMOTE_PLAYERS and remote_states and right_player and right_player in remote_states
     
     left_width = (field_width + REMOTE_BOARD_SPACING) if has_left else 0
+    right_width = (field_width + REMOTE_BOARD_SPACING) if has_right else 0
     center_x = max_x // 2
     local_field_x = center_x - field_width // 2
     offset_x = max(local_field_x, garbage_indicator_width + left_width)
-    offset_y = max((max_y - field_height - 7) // 2, 4)
+    offset_y = max((max_y - field_height - 7) // 2, 3)
     
     try:
         stdscr.erase()
         
-        # Draw target player on left (with TARGET indicator)
         if has_left:
-            rs = remote_states[target_player]
+            rs = remote_states[left_player]
             left_x = offset_x - field_width - REMOTE_BOARD_SPACING
             if left_x >= 0:
                 draw_board(stdscr, rs['board'], rs['shape'], rs['piece_x'], rs['piece_y'],
                           rs['color'], left_x, offset_y, show_ghost=True, 
-                          player_name=target_player, is_dead=rs.get('is_dead', False),
-                          is_target=True)
+                          player_name=left_player, is_dead=rs.get('is_dead', False))
         
-        # Draw title
         title_x = offset_x + (field_width - len(TITLE_TEXT)) // 2
         stdscr.addstr(offset_y - 2, title_x, TITLE_TEXT, curses.A_BOLD | get_color_attr(1))
         
-        # Draw local board
         draw_board(stdscr, board, shape, x, y, color, offset_x, offset_y, show_ghost=True)
+        
         draw_garbage_indicator(stdscr, garbage_info, offset_x, offset_y)
         
-        # Draw preview boxes
         preview_col = offset_x + field_width + 2
         hold_title = f"HOLD ({key_name(keybinds.get('hold'))})"
         draw_preview(stdscr, held_shape, held_piece_name, offset_y, preview_col, hold_title)
         draw_preview(stdscr, next_shape, next_piece_name, offset_y + 8, preview_col, "NEXT")
         
-        # Stats
         stats_y = offset_y + 16
         ko_mult = get_ko_multiplier(ko_count)
         stdscr.addstr(stats_y, preview_col, f"Lines Sent: {total_lines_sent}")
@@ -1191,12 +1253,6 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
             total_count = len(remote_states)
             stdscr.addstr(stats_y + 3, preview_col, f"Alive: {alive_count + 1}/{total_count + 1}")
         
-        # Targeting me indicator
-        if targeting_me_count > 0:
-            targeting_text = f"⚠ {targeting_me_count} TARGETING YOU ⚠"
-            stdscr.addstr(stats_y + 4, preview_col, targeting_text, curses.A_BOLD | get_color_attr(5))
-        
-        # Leaderboard
         leaderboard_col = preview_col + preview_width + 2
         stdscr.addstr(offset_y, leaderboard_col, "=== TOP 10 ===")
         stdscr.addstr(offset_y + 1, leaderboard_col, f"{'#':<3}{'Name':<9}{'Sent':<6}{'KO'}")
@@ -1209,7 +1265,6 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
             else:
                 stdscr.addstr(row_y, leaderboard_col, rank_text)
         
-        # Draw right player
         if has_right:
             rs = remote_states[right_player]
             right_x = leaderboard_col + leaderboard_width + REMOTE_BOARD_SPACING
@@ -1218,12 +1273,9 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
                           rs['color'], right_x, offset_y, show_ghost=True,
                           player_name=right_player, is_dead=rs.get('is_dead', False))
         
-        # Info bar
         info_y = offset_y + HEIGHT + 3
         total_queued = sum(e[0] for e in garbage_info)
-        
-        target_display = target_player if target_player else "None"
-        stdscr.addstr(info_y, offset_x, f"Player: {DISPLAY_NAME}  Target: {target_display}  Lines: {total_lines}")
+        stdscr.addstr(info_y, offset_x, f"Player: {DISPLAY_NAME}  Lines: {total_lines}  Sent: {total_lines_sent}  KOs: {ko_count}  ")
         
         if total_queued > 0:
             min_buffer = min(e[1] for e in garbage_info) if garbage_info else 0
@@ -1236,10 +1288,10 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
         else:
             stdscr.addstr(info_y + 2, offset_x, " " * 30)
         
-        controls = format_controls(keybinds, can_hold)
+        show_cycle = remote_states and len(remote_states) > 2
+        controls = format_controls(keybinds, can_hold, show_cycle)
         stdscr.addstr(info_y + 3, offset_x, controls)
         
-        # Messages
         msg_y = offset_y
         all_msgs = messages + get_ko_messages()
         for i, msg in enumerate(all_msgs[:5]):
@@ -1259,8 +1311,7 @@ def draw(stdscr, board, shape, piece_name, x, y, garbage_info, next_shape, next_
 
 
 def main(stdscr):
-    global garbage_queue, last_read_time, last_clear_was_line, COLORS_INITIALIZED
-    global targeting, remote_view, _garbage_received_from, ko_messages
+    global garbage_queue, last_read_time, last_clear_was_line, COLORS_INITIALIZED, remote_view
 
     curses.curs_set(0)
     stdscr.nodelay(True)
@@ -1277,6 +1328,9 @@ def main(stdscr):
         COLORS_INITIALIZED = True
 
     keybinds = get_keybinds()
+    validate_keybinds(ACTIVE_PROFILE)
+
+    # Clean up old format files from previous versions
     cleanup_old_files()
 
     for i in range(COUNTDOWN_SECONDS, 0, -1):
@@ -1288,7 +1342,7 @@ def main(stdscr):
     board = new_board()
     total_lines = 0
     total_lines_sent = 0
-    garbage_sent_to_target = 0  # Cumulative garbage sent to current target
+    cumulative_garbage_sent = 0  # Track cumulative garbage for state file
     ko_count = 0
     last_state_publish = time.time()
     remote_states = {}
@@ -1373,23 +1427,18 @@ def main(stdscr):
     try:
         while True:
             current_time = time.time()
+
             current_tick = get_current_tick(total_lines)
             speed_level = get_speed_level(total_lines)
 
             if spin_message and current_time - spin_message_time > SPIN_MESSAGE_DURATION:
                 spin_message = ""
 
-            # Get current target
-            current_target = targeting.get_target()
-
             # Publish state regularly
             if current_time - last_state_publish >= STATE_PUBLISH_INTERVAL:
                 last_state_publish = current_time
-                publish_game_state(
-                    board, current_piece_name, current_rotation, x, y,
-                    is_dead, current_target or "none", garbage_sent_to_target,
-                    _garbage_received_from
-                )
+                publish_game_state(board, current_piece_name, current_rotation, x, y, 
+                                  is_dead, cumulative_garbage_sent)
 
             key = stdscr.getch()
             soft_drop_active = False
@@ -1398,11 +1447,8 @@ def main(stdscr):
 
             if key == keybinds.get("quit"):
                 is_dead = True
-                publish_game_state(
-                    board, current_piece_name, current_rotation, x, y,
-                    is_dead, current_target or "none", garbage_sent_to_target,
-                    _garbage_received_from
-                )
+                publish_game_state(board, current_piece_name, current_rotation, x, y,
+                                  is_dead, cumulative_garbage_sent)
                 save_highscore(total_lines_sent, ko_count)
                 cleanup_state_file()
                 break
@@ -1472,21 +1518,17 @@ def main(stdscr):
                 last_rotation_direction = None
                 last_action_was_rotation = False
 
-            # Target cycling with [ and ]
-            if key == keybinds.get("cycle_target"):
-                targeting.cycle_target(1)
-                # Reset garbage counter when switching targets
-                garbage_sent_to_target = 0
-            
-            if key == keybinds.get("cycle_target_back"):
-                targeting.cycle_target(-1)
-                garbage_sent_to_target = 0
+            if key == keybinds.get("cycle_left"):
+                remote_view.cycle_left()
+            if key == keybinds.get("cycle_right"):
+                remote_view.cycle_right()
 
             if moved_or_rotated and lock_delay_start is not None and lock_delay_resets < LOCK_DELAY_RESETS:
                 lock_delay_start = current_time
                 lock_delay_resets += 1
 
             tick_speed = current_tick / 50 if soft_drop_active else current_tick
+
             should_lock = False
 
             if current_time - last_tick >= tick_speed:
@@ -1525,7 +1567,10 @@ def main(stdscr):
                 garbage_to_send = apply_ko_multiplier(base_garbage, ko_count) if base_garbage > 0 else 0
 
                 if cleared > 0:
-                    back_to_back = is_difficult if is_difficult else False
+                    if is_difficult:
+                        back_to_back = True
+                    else:
+                        back_to_back = False
 
                 if is_perfect:
                     spin_message = f"PERFECT CLEAR! (+{garbage_to_send})"
@@ -1548,13 +1593,11 @@ def main(stdscr):
                     spin_message_time = current_time
 
                 if garbage_to_send > 0:
-                    garbage_sent_to_target += garbage_to_send
+                    cumulative_garbage_sent += garbage_to_send
                     total_lines_sent += garbage_to_send
-                    publish_game_state(
-                        board, current_piece_name, current_rotation, x, y,
-                        is_dead, current_target or "none", garbage_sent_to_target,
-                        _garbage_received_from
-                    )
+                    # Publish immediately so others see the garbage
+                    publish_game_state(board, current_piece_name, current_rotation, x, y,
+                                      is_dead, cumulative_garbage_sent)
 
                 if cleared > 0:
                     reduce_garbage_queue(cleared)
@@ -1566,11 +1609,8 @@ def main(stdscr):
 
                 if not spawn_new_piece():
                     is_dead = True
-                    publish_game_state(
-                        board, current_piece_name, current_rotation, x, y,
-                        is_dead, current_target or "none", garbage_sent_to_target,
-                        _garbage_received_from
-                    )
+                    publish_game_state(board, current_piece_name, current_rotation, x, y,
+                                      is_dead, cumulative_garbage_sent)
                     save_highscore(total_lines_sent, ko_count)
                     cleanup_state_file()
                     break
@@ -1581,22 +1621,16 @@ def main(stdscr):
                 
                 if SHOW_REMOTE_PLAYERS:
                     remote_states = get_remote_player_states()
-                    targeting.update(remote_states)
+                    remote_view.update(remote_states)
                     
-                    current_target = targeting.get_target()
-                    remote_view.update(remote_states, current_target)
-                    
-                    # Process incoming garbage (only from players targeting us)
-                    garbage_list = process_incoming_garbage(remote_states, PLAYER)
+                    # Process incoming garbage from other players
+                    garbage_list = process_incoming_garbage(remote_states)
                     for amount, sender in garbage_list:
                         queue_garbage(amount, sender)
                     
-                    # Check for KOs (players who died with our garbage)
-                    new_ko_players = check_for_kos(remote_states, _garbage_received_from)
-                    for player in new_ko_players:
-                        ko_count += 1
-                        msg = random.choice(KO_MESSAGES).format(player=player, kos=ko_count)
-                        ko_messages.append((msg, time.time() + MESSAGE_DISPLAY_TIME))
+                    # Process deaths (KOs)
+                    new_kos = process_deaths(remote_states, ko_count)
+                    ko_count += new_kos
 
             if current_time - last_leaderboard_refresh >= LEADERBOARD_REFRESH:
                 last_leaderboard_refresh = current_time
@@ -1605,15 +1639,14 @@ def main(stdscr):
             garbage_display = get_garbage_display_info()
             messages = get_active_messages()
 
-            current_target = targeting.get_target()
+            left_player = remote_view.get_left_player()
             right_player = remote_view.get_right_player()
-            targeting_me = count_players_targeting_me(remote_states, PLAYER) if remote_states else 0
 
             draw(stdscr, board, shape, current_piece_name, x, y, garbage_display,
                  next_shape, next_piece_name, held_shape, held_piece_name,
                  can_hold, current_color, spin_message, total_lines,
                  total_lines_sent, ko_count, speed_level, leaderboard, messages, keybinds,
-                 remote_states, current_target, right_player, targeting_me)
+                 remote_states, left_player, right_player)
 
             time.sleep(LOOP_SLEEP)
 
